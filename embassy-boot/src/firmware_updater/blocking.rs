@@ -6,7 +6,7 @@ use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embedded_storage::nor_flash::NorFlash;
 
 use super::FirmwareUpdaterConfig;
-use crate::{BOOT_MAGIC, DFU_DETACH_MAGIC, FirmwareUpdaterError, STATE_ERASE_VALUE, SWAP_MAGIC, State};
+use crate::{BOOT_MAGIC, DFU_DETACH_MAGIC, FirmwareUpdaterError, STATE_ERASE_VALUE, SWAP_MAGIC, State, VERIFY_MAGIC};
 
 /// Blocking FirmwareUpdater is an application API for interacting with the BootLoader without the ability to
 /// 'mess up' the internal bootloader state
@@ -105,6 +105,16 @@ impl<'d, DFU: NorFlash, STATE: NorFlash> BlockingFirmwareUpdater<'d, DFU, STATE>
         self.state.get_state()
     }
 
+    /// Mark a fully staged update as pending verification.
+    pub fn mark_verify(&mut self) -> Result<(), FirmwareUpdaterError> {
+        self.state.mark_verify()
+    }
+
+    /// Reject a pending update without modifying the staged bytes.
+    pub fn reject_update(&mut self) -> Result<(), FirmwareUpdaterError> {
+        self.state.reject_update()
+    }
+
     /// Verify the DFU given a public key. If there is an error then DO NOT
     /// proceed with updating the firmware as it must be signed with a
     /// corresponding private key (otherwise it could be malicious firmware).
@@ -119,65 +129,19 @@ impl<'d, DFU: NorFlash, STATE: NorFlash> BlockingFirmwareUpdater<'d, DFU, STATE>
     #[cfg(feature = "_verify")]
     pub fn verify_and_mark_updated(
         &mut self,
-        _public_key: &[u8; 32],
-        _signature: &[u8; 64],
-        _update_len: u32,
+        public_key: &[u8; 32],
+        signature: &[u8; 64],
+        update_len: u32,
     ) -> Result<(), FirmwareUpdaterError> {
-        assert!(_update_len <= self.dfu.capacity() as u32);
-
-        self.state.verify_booted()?;
-
-        #[cfg(feature = "ed25519-dalek")]
-        {
-            use ed25519_dalek::{Signature, SignatureError, Verifier, VerifyingKey};
-
-            use crate::digest_adapters::ed25519_dalek::Sha512;
-
-            let into_signature_error = |e: SignatureError| FirmwareUpdaterError::Signature(e.into());
-
-            let public_key = VerifyingKey::from_bytes(_public_key).map_err(into_signature_error)?;
-            let signature = Signature::from_bytes(_signature);
-
-            let mut message = [0; 64];
-            let mut chunk_buf = [0; 2];
-            self.hash::<Sha512>(_update_len, &mut chunk_buf, &mut message)?;
-
-            public_key.verify(&message, &signature).map_err(into_signature_error)?;
-            return self.state.mark_updated();
+        let mut scratch = [0; 64];
+        if !matches!(
+            self.state.get_state()?,
+            State::Verify | State::Boot | State::DfuDetach | State::Revert
+        ) {
+            return Err(FirmwareUpdaterError::BadState);
         }
-        #[cfg(feature = "ed25519-salty")]
-        {
-            use salty::{PublicKey, Signature};
-
-            use crate::digest_adapters::salty::Sha512;
-            use crate::fmt::Bytes;
-
-            fn into_signature_error<E>(_: E) -> FirmwareUpdaterError {
-                FirmwareUpdaterError::Signature(signature::Error::default())
-            }
-
-            let public_key = PublicKey::try_from(_public_key).map_err(into_signature_error)?;
-            let signature = Signature::try_from(_signature).map_err(into_signature_error)?;
-
-            let mut message = [0; 64];
-            let mut chunk_buf = [0; 2];
-            self.hash::<Sha512>(_update_len, &mut chunk_buf, &mut message)?;
-
-            let r = public_key.verify(&message, &signature);
-            trace!(
-                "Verifying with public key {}, signature {} and message {} yields ok: {}",
-                Bytes(&public_key.to_bytes()),
-                Bytes(&signature.to_bytes()),
-                Bytes(&message),
-                r.is_ok()
-            );
-            r.map_err(into_signature_error)?;
-            return self.state.mark_updated();
-        }
-        #[cfg(not(any(feature = "ed25519-dalek", feature = "ed25519-salty")))]
-        {
-            Err(FirmwareUpdaterError::Signature(signature::Error::new()))
-        }
+        crate::verification::verify_firmware(&mut self.dfu, 0, update_len, &mut scratch, public_key, signature)?;
+        self.state.mark_updated()
     }
 
     /// Verify the update in DFU with any digest.
@@ -209,7 +173,6 @@ impl<'d, DFU: NorFlash, STATE: NorFlash> BlockingFirmwareUpdater<'d, DFU, STATE>
     }
 
     /// Mark to trigger firmware swap on next boot.
-    #[cfg(not(feature = "_verify"))]
     pub fn mark_updated(&mut self) -> Result<(), FirmwareUpdaterError> {
         self.state.mark_updated()
     }
@@ -357,6 +320,23 @@ impl<'d, STATE: NorFlash> BlockingFirmwareState<'d, STATE> {
     /// Mark to trigger firmware swap on next boot.
     pub fn mark_updated(&mut self) -> Result<(), FirmwareUpdaterError> {
         self.set_magic(SWAP_MAGIC)
+    }
+
+    /// Mark a fully staged update as pending verification.
+    pub fn mark_verify(&mut self) -> Result<(), FirmwareUpdaterError> {
+        match self.get_state()? {
+            State::Verify => Ok(()),
+            State::Boot | State::DfuDetach | State::Revert => self.set_magic(VERIFY_MAGIC),
+            State::Swap => Err(FirmwareUpdaterError::BadState),
+        }
+    }
+
+    /// Reject a pending update and return to normal boot state.
+    pub fn reject_update(&mut self) -> Result<(), FirmwareUpdaterError> {
+        if self.get_state()? != State::Verify {
+            return Err(FirmwareUpdaterError::BadState);
+        }
+        self.set_magic(BOOT_MAGIC)
     }
 
     /// Mark to trigger USB DFU on next boot.

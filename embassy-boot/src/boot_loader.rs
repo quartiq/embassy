@@ -5,7 +5,7 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embedded_storage::nor_flash::{NorFlash, NorFlashError, NorFlashErrorKind};
 
-use crate::{DFU_DETACH_MAGIC, REVERT_MAGIC, STATE_ERASE_VALUE, SWAP_MAGIC, State};
+use crate::{DFU_DETACH_MAGIC, REVERT_MAGIC, STATE_ERASE_VALUE, SWAP_MAGIC, State, VERIFY_MAGIC};
 
 /// Errors returned by bootloader
 #[derive(PartialEq, Eq, Debug)]
@@ -137,7 +137,7 @@ pub struct BootLoader<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> {
     /// All ranges are in multiples of WRITE_SIZE bytes.
     /// N = Active partition size divided by WRITE_SIZE.
     /// | Range              | Description                                                                      |
-    /// | 0..1               | Magic indicating bootloader state. BOOT_MAGIC means boot, SWAP_MAGIC means swap. |
+    /// | 0..1               | Magic indicating bootloader state.                                             |
     /// | 1..2               | Progress validity. ERASE_VALUE means valid, !ERASE_VALUE means invalid.          |
     /// | 2..(2 + 2N)        | Progress index used while swapping                                               |
     /// | (2 + 2N)..(2 + 4N) | Progress index used while reverting
@@ -165,6 +165,10 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, S
     }
 
     /// Perform necessary boot preparations like swapping images.
+    ///
+    /// A pending [`State::Verify`] is reported without touching either image.
+    /// When a failed trial is reverted during this call, [`State::Revert`] is
+    /// returned immediately.
     ///
     /// The DFU partition is assumed to be 1 page bigger than the active partition for the swap
     /// algorithm to work correctly.
@@ -254,7 +258,7 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, S
         assert_partitions(&self.active, &self.dfu, &self.state, Self::PAGE_SIZE);
 
         // Copy contents from partition N to active
-        let state = self.read_state(aligned_buf)?;
+        let mut state = self.read_state(aligned_buf)?;
         if state == State::Swap {
             //
             // Check if we already swapped. If we're in the swap state, this means we should revert
@@ -280,6 +284,7 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, S
                 // Set magic
                 state_word.fill(REVERT_MAGIC);
                 self.state.write(0, state_word)?;
+                state = State::Revert;
             }
         }
         Ok(state)
@@ -292,6 +297,8 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, S
 
         if !state_word.iter().any(|&b| b != SWAP_MAGIC) {
             Ok(State::Swap)
+        } else if !state_word.iter().any(|&b| b != VERIFY_MAGIC) {
+            Ok(State::Verify)
         } else if !state_word.iter().any(|&b| b != DFU_DETACH_MAGIC) {
             Ok(State::DfuDetach)
         } else if !state_word.iter().any(|&b| b != REVERT_MAGIC) {

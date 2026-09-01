@@ -8,7 +8,7 @@ use embassy_usb::class::dfu::dfu_mode::Handler as DfuModeHandler;
 use embassy_usb::control::{InResponse, OutResponse, Recipient, Request as ControlRequest, RequestType};
 use embassy_usb::driver::Direction;
 use embassy_usb_dfu::consts::DfuAttributes;
-use embassy_usb_dfu::{Reset, UsbDfuState, new_state};
+use embassy_usb_dfu::{Reset, UsbDfuState, new_state, new_state_deferred};
 use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
 
 const READ_WRITE_SIZE: usize = 8;
@@ -138,7 +138,7 @@ impl<H: DfuModeHandler> DfuIo for InMemoryDfu<H> {
     }
 }
 
-fn usb_dfu(dfu_attributes: DfuAttributes) {
+fn usb_dfu(dfu_attributes: DfuAttributes, defer_verification: bool) {
     let mut aligned_buffer = [0; READ_WRITE_SIZE];
 
     const BLOCK_SIZE: usize = 128;
@@ -162,7 +162,11 @@ fn usb_dfu(dfu_attributes: DfuAttributes) {
         transfer_size: READ_WRITE_SIZE as u16,
         dfu_version: (1, 1),
     };
-    let dfu_state = new_state::<_, _, _, BLOCK_SIZE>(updater, dfu_attributes, NoopReset {});
+    let dfu_state = if defer_verification {
+        new_state_deferred::<_, _, _, BLOCK_SIZE>(updater, dfu_attributes, NoopReset {})
+    } else {
+        new_state::<_, _, _, BLOCK_SIZE>(updater, dfu_attributes, NoopReset {})
+    };
     let mut dfu = dfu_core::sync::DfuSync::new(InMemoryDfu {
         functional_descriptor,
         dfu_state: RefCell::new(dfu_state),
@@ -173,24 +177,39 @@ fn usb_dfu(dfu_attributes: DfuAttributes) {
     println!("{:?}", err);
     assert_eq!(&dfu_buffer.borrow()[..firmware.len()], firmware);
     assert!(err.is_ok());
+    drop(dfu);
+    if defer_verification {
+        assert_eq!(&state_buffer.borrow()[..READ_WRITE_SIZE], &[0xb0; READ_WRITE_SIZE]);
+    }
 }
 
 #[test]
 fn test_usb_dfu_manifestation_tolerant_will_detach() {
-    usb_dfu(DfuAttributes::CAN_DOWNLOAD | DfuAttributes::MANIFESTATION_TOLERANT | DfuAttributes::WILL_DETACH);
+    usb_dfu(
+        DfuAttributes::CAN_DOWNLOAD | DfuAttributes::MANIFESTATION_TOLERANT | DfuAttributes::WILL_DETACH,
+        false,
+    );
 }
 
 #[test]
 fn test_usb_dfu_manifestation_tolerant() {
-    usb_dfu(DfuAttributes::CAN_DOWNLOAD | DfuAttributes::MANIFESTATION_TOLERANT);
+    usb_dfu(
+        DfuAttributes::CAN_DOWNLOAD | DfuAttributes::MANIFESTATION_TOLERANT,
+        false,
+    );
 }
 
 #[test]
 fn test_usb_dfu_will_detach() {
-    usb_dfu(DfuAttributes::CAN_DOWNLOAD | DfuAttributes::WILL_DETACH);
+    usb_dfu(DfuAttributes::CAN_DOWNLOAD | DfuAttributes::WILL_DETACH, false);
 }
 
 #[test]
 fn test_usb_dfu() {
-    usb_dfu(DfuAttributes::CAN_DOWNLOAD);
+    usb_dfu(DfuAttributes::CAN_DOWNLOAD, false);
+}
+
+#[test]
+fn test_usb_dfu_deferred_verification() {
+    usb_dfu(DfuAttributes::CAN_DOWNLOAD, true);
 }

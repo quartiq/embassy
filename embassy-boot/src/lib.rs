@@ -16,6 +16,8 @@ mod firmware_updater;
 mod mem_flash;
 #[cfg(test)]
 mod test_flash;
+#[cfg(feature = "_verify")]
+pub mod verification;
 
 // The expected value of the flash after an erase
 // TODO: Use the value provided by NorFlash when available
@@ -34,10 +36,12 @@ pub(crate) const REVERT_MAGIC: u8 = 0xC0;
 pub(crate) const BOOT_MAGIC: u8 = 0xD0;
 pub(crate) const SWAP_MAGIC: u8 = 0xF0;
 pub(crate) const DFU_DETACH_MAGIC: u8 = 0xE0;
+pub(crate) const VERIFY_MAGIC: u8 = 0xB0;
 
 /// The state of the bootloader after running prepare.
 #[derive(PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
 pub enum State {
     /// Bootloader is ready to boot the active partition.
     Boot,
@@ -47,6 +51,8 @@ pub enum State {
     Revert,
     /// Application has received a request to reboot into DFU mode to apply an update.
     DfuDetach,
+    /// An update is staged in the DFU partition but must be verified before it can be swapped.
+    Verify,
 }
 
 impl<T> From<T> for State
@@ -57,6 +63,8 @@ where
         let magic = magic.as_ref();
         if !magic.iter().any(|&b| b != SWAP_MAGIC) {
             State::Swap
+        } else if !magic.iter().any(|&b| b != VERIFY_MAGIC) {
+            State::Verify
         } else if !magic.iter().any(|&b| b != REVERT_MAGIC) {
             State::Revert
         } else if !magic.iter().any(|&b| b != DFU_DETACH_MAGIC) {
@@ -135,6 +143,35 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_state_does_not_copy() {
+        const FIRMWARE_SIZE: usize = 8192;
+        let flash = BlockingTestFlash::new(BootLoaderConfig {
+            active: MemFlash::<FIRMWARE_SIZE, 4096, 4>::default(),
+            dfu: MemFlash::<12288, 4096, 4>::default(),
+            state: MemFlash::<4096, 4096, 4>::default(),
+        });
+        let active = [0x55; FIRMWARE_SIZE];
+        let update = [0xaa; FIRMWARE_SIZE];
+        flash.active().write(0, &active).unwrap();
+        flash.dfu().write(0, &update).unwrap();
+        flash.state().write(0, &[VERIFY_MAGIC; 4]).unwrap();
+
+        let mut bootloader = BootLoader::new(BootLoaderConfig {
+            active: flash.active(),
+            dfu: flash.dfu(),
+            state: flash.state(),
+        });
+        let mut page = [0; 4096];
+        assert_eq!(State::Verify, bootloader.prepare_boot(&mut page).unwrap());
+
+        let mut read = [0; FIRMWARE_SIZE];
+        flash.active().read(0, &mut read).unwrap();
+        assert_eq!(active, read);
+        flash.dfu().read(0, &mut read).unwrap();
+        assert_eq!(update, read);
+    }
+
+    #[test]
     #[cfg(not(feature = "_verify"))]
     fn test_swap_state() {
         // The flashes and buffers used here are large, run on a thread with a bigger stack.
@@ -193,10 +230,7 @@ mod tests {
         flash.dfu().read(4096, &mut read_buf).unwrap();
         assert_eq!(ORIGINAL, read_buf);
 
-        // Running again should cause a revert
-        assert_eq!(State::Swap, bootloader.prepare_boot(&mut page).unwrap());
-
-        // Next time we know it was reverted
+        // Running again should cause and report a revert.
         assert_eq!(State::Revert, bootloader.prepare_boot(&mut page).unwrap());
 
         let mut read_buf = [0; FIRMWARE_SIZE];
@@ -332,6 +366,8 @@ mod tests {
         digest.update(&firmware);
         let message = digest.finalize();
         let signature: Signature = keypair.sign(&message);
+        let mut invalid_signature = signature.to_bytes();
+        invalid_signature[0] ^= 1;
 
         let public_key = keypair.verifying_key();
 
@@ -343,9 +379,8 @@ mod tests {
         });
 
         let firmware_len = firmware.len();
-
         let mut write_buf = [0; 4096];
-        write_buf[0..firmware_len].copy_from_slice(firmware);
+        write_buf[..firmware_len].copy_from_slice(firmware);
         flash.dfu().write(0, &write_buf).unwrap();
 
         // On with the test
@@ -360,6 +395,20 @@ mod tests {
         );
 
         assert!(
+            block_on(updater.verify_and_mark_updated(&public_key.to_bytes(), &invalid_signature, firmware_len as u32,))
+                .is_err()
+        );
+        assert_eq!(block_on(updater.get_state()).unwrap(), State::Boot);
+
+        block_on(updater.mark_verify()).unwrap();
+        block_on(updater.mark_verify()).unwrap();
+        assert!(
+            block_on(updater.verify_and_mark_updated(&public_key.to_bytes(), &invalid_signature, firmware_len as u32,))
+                .is_err()
+        );
+        assert_eq!(block_on(updater.get_state()).unwrap(), State::Verify);
+
+        assert!(
             block_on(updater.verify_and_mark_updated(
                 &public_key.to_bytes(),
                 &signature.to_bytes(),
@@ -367,5 +416,6 @@ mod tests {
             ))
             .is_ok()
         );
+        assert_eq!(block_on(updater.get_state()).unwrap(), State::Swap);
     }
 }
